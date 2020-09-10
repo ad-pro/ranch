@@ -160,6 +160,23 @@ We recommend the use of port rewriting for systems with a single server,
 and load balancing for systems with multiple servers. Documenting these
 solutions is however out of the scope of this guide.
 
+=== Listening on a UNIX Domain socket
+
+On UNIX systems, it is also possible to use Ranch to listen on a UNIX
+domain socket by specifying `{local, SocketFile}` for the `ip` socket
+option. In this case, the port must be set to 0 or omitted. The given
+file must not exist: Ranch must be able to create it.
+
+.Starting a listener for TCP connections on a UNIX Domain socket
+
+[source,erlang]
+{ok, _} = ranch:start_listener(tcp_echo,
+    ranch_tcp, #{socket_opts => [
+        {ip, {local, "/tmp/ranch_echo.sock"}},
+        {port, 0}
+    ]}, echo_protocol, []
+).
+
 === Accepting connections on an existing socket
 
 If you want to accept connections on an existing socket, you can write
@@ -222,8 +239,8 @@ with the name of the listener as the only argument.
 [source,erlang]
 ranch:remove_connection(Ref).
 
-As seen in the chapter covering protocols, this pid is received as the
-first argument of the protocol's `start_link/4` callback.
+As seen in the chapter covering protocols, this reference is received
+as the first argument of the protocol's `start_link/3` callback.
 
 You can modify the `max_connections` value on a running listener by
 using the `ranch:set_max_connections/2` function, with the name of the
@@ -341,14 +358,9 @@ Opts = ranch:get_protocol_options(tcp_echo).
 
 === Changing transport options
 
-Ranch allows you to change the transport options of a listener, for
-example to make it listen on a different port.
-
-To change transport options, the listener has to be suspended first.
-Then you are allowed to change the transport options by calling
-`ranch:set_transport_options/2` with the listener name and the new
-transport options as arguments.
-After that, you can resume the listener.
+Ranch allows you to change the transport options of a listener with
+the `ranch:set_transport_options/2` function, for example to change the
+number of acceptors or to make it listen on a different port.
 
 .Changing the transport options
 

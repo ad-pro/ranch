@@ -1,4 +1,5 @@
-%% Copyright (c) 2011-2018, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) 2011-2020, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) 2020, Jan Uhlig <j.uhlig@mailingwork.de>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -19,9 +20,14 @@
 -export([stop_listener/1]).
 -export([suspend_listener/1]).
 -export([resume_listener/1]).
+-export([stop_all_acceptors/0]).
+-export([restart_all_acceptors/0]).
 -export([child_spec/5]).
 -export([handshake/1]).
 -export([handshake/2]).
+-export([handshake_continue/1]).
+-export([handshake_continue/2]).
+-export([handshake_cancel/1]).
 -export([recv_proxy_header/2]).
 -export([remove_connection/1]).
 -export([get_status/1]).
@@ -38,7 +44,7 @@
 -export([procs/2]).
 -export([wait_for_connections/3]).
 -export([wait_for_connections/4]).
--export([filter_options/3]).
+-export([filter_options/4]).
 -export([set_option_default/3]).
 -export([require/1]).
 -export([log/4]).
@@ -46,7 +52,10 @@
 -type max_conns() :: non_neg_integer() | infinity.
 -export_type([max_conns/0]).
 
--type opts() :: any() | #{
+-type opts() :: any() | transport_opts(any()).
+-export_type([opts/0]).
+
+-type transport_opts(SocketOpts) :: #{
 	connection_type => worker | supervisor,
 	handshake_timeout => timeout(),
 	max_connections => max_conns(),
@@ -55,9 +64,9 @@
 	num_conns_sups => pos_integer(),
 	num_listen_sockets => pos_integer(),
 	shutdown => timeout() | brutal_kill,
-	socket_opts => any()
+	socket_opts => SocketOpts
 }.
--export_type([opts/0]).
+-export_type([transport_opts/1]).
 
 -type ref() :: any().
 -export_type([ref/0]).
@@ -68,19 +77,70 @@ start_listener(Ref, Transport, TransOpts0, Protocol, ProtoOpts)
 		when is_atom(Transport), is_atom(Protocol) ->
 	TransOpts = normalize_opts(TransOpts0),
 	_ = code:ensure_loaded(Transport),
-	case erlang:function_exported(Transport, name, 0) of
-		false ->
-			{error, badarg};
-		true ->
-			maybe_started(supervisor:start_child(ranch_sup, child_spec(Ref,
-					Transport, TransOpts, Protocol, ProtoOpts)))
+	case {erlang:function_exported(Transport, name, 0), validate_transport_opts(TransOpts)} of
+		{true, ok} ->
+			ChildSpec = #{id => {ranch_listener_sup, Ref}, start => {ranch_listener_sup, start_link, [
+				Ref, Transport, TransOpts, Protocol, ProtoOpts
+			]}, type => supervisor},
+			maybe_started(supervisor:start_child(ranch_sup, ChildSpec));
+		{false, _} ->
+			{error, {bad_transport, Transport}};
+		{_, TransOptsError} ->
+			TransOptsError
 	end.
 
--spec normalize_opts(opts()) -> opts().
+-spec normalize_opts(opts()) -> transport_opts(any()).
 normalize_opts(Map) when is_map(Map) ->
 	Map;
 normalize_opts(Any) ->
 	#{socket_opts => Any}.
+
+-spec validate_transport_opts(transport_opts(any())) -> ok | {error, any()}.
+validate_transport_opts(Opts) ->
+	maps:fold(fun
+		(Key, Value, ok) ->
+			case validate_transport_opt(Key, Value, Opts) of
+				true ->
+					ok;
+				false ->
+					{error, {bad_option, Key}}
+			end;
+		(_, _, Acc) ->
+			Acc
+	end, ok, Opts).
+
+-spec validate_transport_opt(any(), any(), transport_opts(any())) -> boolean().
+validate_transport_opt(connection_type, worker, _) ->
+	true;
+validate_transport_opt(connection_type, supervisor, _) ->
+	true;
+validate_transport_opt(handshake_timeout, infinity, _) ->
+	true;
+validate_transport_opt(handshake_timeout, Value, _) ->
+	is_integer(Value) andalso Value >= 0;
+validate_transport_opt(max_connections, infinity, _) ->
+	true;
+validate_transport_opt(max_connections, Value, _) ->
+	is_integer(Value) andalso Value >= 0;
+validate_transport_opt(logger, Value, _) ->
+	is_atom(Value);
+validate_transport_opt(num_acceptors, Value, _) ->
+	is_integer(Value) andalso Value > 0;
+validate_transport_opt(num_conns_sups, Value, _) ->
+	is_integer(Value) andalso Value > 0;
+validate_transport_opt(num_listen_sockets, Value, Opts) ->
+	is_integer(Value) andalso Value > 0
+		andalso Value =< maps:get(num_acceptors, Opts, 10);
+validate_transport_opt(shutdown, brutal_kill, _) ->
+	true;
+validate_transport_opt(shutdown, infinity, _) ->
+	true;
+validate_transport_opt(shutdown, Value, _) ->
+	is_integer(Value) andalso Value >= 0;
+validate_transport_opt(socket_opts, _, _) ->
+	true;
+validate_transport_opt(_, _, _) ->
+	false.
 
 maybe_started({error, {{shutdown,
 		{failed_to_start_child, ranch_acceptors_sup,
@@ -96,10 +156,13 @@ start_error(_, Error) -> Error.
 
 -spec stop_listener(ref()) -> ok | {error, not_found}.
 stop_listener(Ref) ->
+	[_, Transport, _, _, _] = ranch_server:get_listener_start_args(Ref),
+	TransOpts = get_transport_options(Ref),
 	case supervisor:terminate_child(ranch_sup, {ranch_listener_sup, Ref}) of
 		ok ->
 			_ = supervisor:delete_child(ranch_sup, {ranch_listener_sup, Ref}),
-			ranch_server:cleanup_listener_opts(Ref);
+			ranch_server:cleanup_listener_opts(Ref),
+			Transport:cleanup(TransOpts);
 		{error, Reason} ->
 			{error, Reason}
 	end.
@@ -135,36 +198,94 @@ maybe_resumed({ok, _, _}) ->
 maybe_resumed(Res) ->
 	Res.
 
+-spec stop_all_acceptors() -> ok.
+stop_all_acceptors() ->
+	_ = [ok = do_acceptors(Pid, terminate_child)
+		|| {_, Pid} <- ranch_server:get_listener_sups()],
+	ok.
+
+-spec restart_all_acceptors() -> ok.
+restart_all_acceptors() ->
+	_ = [ok = do_acceptors(Pid, restart_child)
+		|| {_, Pid} <- ranch_server:get_listener_sups()],
+	ok.
+
+do_acceptors(ListenerSup, F) ->
+	ListenerChildren = supervisor:which_children(ListenerSup),
+	case lists:keyfind(ranch_acceptors_sup, 1, ListenerChildren) of
+		{_, AcceptorsSup, _, _} when is_pid(AcceptorsSup) ->
+			AcceptorChildren = supervisor:which_children(AcceptorsSup),
+			%% @todo What about errors?
+			_ = [supervisor:F(AcceptorsSup, AcceptorId)
+				|| {AcceptorId, _, _, _} <- AcceptorChildren],
+			ok;
+		{_, Atom, _, _} ->
+			{error, Atom}
+	end.
+
 -spec child_spec(ref(), module(), opts(), module(), any())
 	-> supervisor:child_spec().
 child_spec(Ref, Transport, TransOpts0, Protocol, ProtoOpts) ->
 	TransOpts = normalize_opts(TransOpts0),
-	{{ranch_listener_sup, Ref}, {ranch_listener_sup, start_link, [
+	#{id => {ranch_embedded_sup, Ref}, start => {ranch_embedded_sup, start_link, [
 		Ref, Transport, TransOpts, Protocol, ProtoOpts
-	]}, permanent, infinity, supervisor, [ranch_listener_sup]}.
+	]}, type => supervisor}.
 
--spec handshake(ref()) -> {ok, ranch_transport:socket()}.
+-spec handshake(ref()) -> {ok, ranch_transport:socket()} | {continue, any()}.
 handshake(Ref) ->
-	handshake(Ref, []).
+	handshake1(Ref, undefined).
 
--spec handshake(ref(), any()) -> {ok, ranch_transport:socket()}.
+-spec handshake(ref(), any()) -> {ok, ranch_transport:socket()} | {continue, any()}.
 handshake(Ref, Opts) ->
-	receive {handshake, Ref, Transport, CSocket, HandshakeTimeout} ->
-		case Transport:handshake(CSocket, Opts, HandshakeTimeout) of
-			OK = {ok, _} ->
-				OK;
-			%% Garbage was most likely sent to the socket, don't error out.
-			{error, {tls_alert, _}} ->
-				ok = Transport:close(CSocket),
-				exit(normal);
-			%% Socket most likely stopped responding, don't error out.
-			{error, Reason} when Reason =:= timeout; Reason =:= closed ->
-				ok = Transport:close(CSocket),
-				exit(normal);
-			{error, Reason} ->
-				ok = Transport:close(CSocket),
-				error(Reason)
-		end
+	handshake1(Ref, {opts, Opts}).
+
+handshake1(Ref, Opts) ->
+	receive {handshake, Ref, Transport, CSocket, Timeout} ->
+		Handshake = handshake_transport(Transport, handshake, CSocket, Opts, Timeout),
+		handshake_result(Handshake, Ref, Transport, CSocket, Timeout)
+	end.
+
+-spec handshake_continue(ref()) -> {ok, ranch_transport:socket()}.
+handshake_continue(Ref) ->
+	handshake_continue1(Ref, undefined).
+
+-spec handshake_continue(ref(), any()) -> {ok, ranch_transport:socket()}.
+handshake_continue(Ref, Opts) ->
+	handshake_continue1(Ref, {opts, Opts}).
+
+handshake_continue1(Ref, Opts) ->
+	receive {handshake_continue, Ref, Transport, CSocket, Timeout} ->
+		Handshake = handshake_transport(Transport, handshake_continue, CSocket, Opts, Timeout),
+		handshake_result(Handshake, Ref, Transport, CSocket, Timeout)
+	end.
+
+handshake_transport(Transport, Fun, CSocket, undefined, Timeout) ->
+	Transport:Fun(CSocket, Timeout);
+handshake_transport(Transport, Fun, CSocket, {opts, Opts}, Timeout) ->
+	Transport:Fun(CSocket, Opts, Timeout).
+
+handshake_result(Result, Ref, Transport, CSocket, Timeout) ->
+	case Result of
+		OK = {ok, _} ->
+			OK;
+		{ok, CSocket2, Info} ->
+			self() ! {handshake_continue, Ref, Transport, CSocket2, Timeout},
+			{continue, Info};
+		{error, {tls_alert, _}} ->
+			ok = Transport:close(CSocket),
+			exit(normal);
+		{error, Reason} when Reason =:= timeout; Reason =:= closed ->
+			ok = Transport:close(CSocket),
+			exit(normal);
+		{error, Reason} ->
+			ok = Transport:close(CSocket),
+			error(Reason)
+	end.
+
+-spec handshake_cancel(ref()) -> ok.
+handshake_cancel(Ref) ->
+	receive {handshake_continue, Ref, Transport, CSocket, _} ->
+		Transport:handshake_cancel(CSocket)
 	end.
 
 %% Unlike handshake/2 this function always return errors because
@@ -201,14 +322,19 @@ get_status(Ref) ->
 			running
 	end.
 
--spec get_addr(ref()) -> {inet:ip_address(), inet:port_number()} | {undefined, undefined}.
+-spec get_addr(ref()) -> {inet:ip_address(), inet:port_number()} |
+	{local, binary()} | {undefined, undefined}.
 get_addr(Ref) ->
 	ranch_server:get_addr(Ref).
 
 -spec get_port(ref()) -> inet:port_number() | undefined.
 get_port(Ref) ->
-	{_, Port} = get_addr(Ref),
-	Port.
+	case get_addr(Ref) of
+		{local, _} ->
+			undefined;
+		{_, Port} ->
+			Port
+	end.
 
 -spec get_connections(ref(), active|all) -> non_neg_integer().
 get_connections(Ref, active) ->
@@ -228,21 +354,27 @@ get_max_connections(Ref) ->
 set_max_connections(Ref, MaxConnections) ->
 	ranch_server:set_max_connections(Ref, MaxConnections).
 
--spec get_transport_options(ref()) -> any().
+-spec get_transport_options(ref()) -> transport_opts(any()).
 get_transport_options(Ref) ->
 	ranch_server:get_transport_options(Ref).
 
--spec set_transport_options(ref(), opts()) -> ok | {error, running}.
+-spec set_transport_options(ref(), opts()) -> ok | {error, term()}.
 set_transport_options(Ref, TransOpts0) ->
 	TransOpts = normalize_opts(TransOpts0),
-	case get_status(Ref) of
-		suspended ->
-			ok = ranch_server:set_transport_options(Ref, TransOpts);
-		running ->
-			{error, running}
+	case validate_transport_opts(TransOpts) of
+		ok ->
+			ok = ranch_server:set_transport_options(Ref, TransOpts),
+			ok = apply_transport_options(Ref, TransOpts);
+		TransOptsError ->
+			TransOptsError
 	end.
 
--spec get_protocol_options(ref()) -> opts().
+apply_transport_options(Ref, TransOpts) ->
+	_ = [ConnsSup ! {set_transport_options, TransOpts}
+		|| {_, ConnsSup} <- ranch_server:get_connections_sups(Ref)],
+	ok.
+
+-spec get_protocol_options(ref()) -> any().
 get_protocol_options(Ref) ->
 	ranch_server:get_protocol_options(Ref).
 
@@ -250,12 +382,17 @@ get_protocol_options(Ref) ->
 set_protocol_options(Ref, Opts) ->
 	ranch_server:set_protocol_options(Ref, Opts).
 
--spec info() -> [{any(), [{atom(), any()}]}].
+-spec info() -> #{ref() := #{atom() := term()}}.
 info() ->
-	[{Ref, listener_info(Ref, Pid)}
-		|| {Ref, Pid} <- ranch_server:get_listener_sups()].
+	lists:foldl(
+		fun ({Ref, Pid}, Acc) ->
+			Acc#{Ref => listener_info(Ref, Pid)}
+		end,
+		#{},
+		ranch_server:get_listener_sups()
+	).
 
--spec info(ref()) -> [{atom(), any()}].
+-spec info(ref()) -> #{atom() := term()}.
 info(Ref) ->
 	Pid = ranch_server:get_listener_sup(Ref),
 	listener_info(Ref, Pid).
@@ -263,23 +400,28 @@ info(Ref) ->
 listener_info(Ref, Pid) ->
 	[_, Transport, _, Protocol, _] = ranch_server:get_listener_start_args(Ref),
 	Status = get_status(Ref),
-	{IP, Port} = get_addr(Ref),
+	{IP, Port} = case get_addr(Ref) of
+		Addr = {local, _} ->
+			{Addr, undefined};
+		Addr ->
+			Addr
+	end,
 	MaxConns = get_max_connections(Ref),
 	TransOpts = ranch_server:get_transport_options(Ref),
 	ProtoOpts = get_protocol_options(Ref),
-	[
-		{pid, Pid},
-		{status, Status},
-		{ip, IP},
-		{port, Port},
-		{max_connections, MaxConns},
-		{active_connections, get_connections(Ref, active)},
-		{all_connections, get_connections(Ref, all)},
-		{transport, Transport},
-		{transport_options, TransOpts},
-		{protocol, Protocol},
-		{protocol_options, ProtoOpts}
-	].
+	#{
+		pid => Pid,
+		status => Status,
+		ip => IP,
+		port => Port,
+		max_connections => MaxConns,
+		active_connections => get_connections(Ref, active),
+		all_connections => get_connections(Ref, all),
+		transport => Transport,
+		transport_options => TransOpts,
+		protocol => Protocol,
+		protocol_options => ProtoOpts
+	}.
 
 -spec procs(ref(), acceptors | connections) -> [pid()].
 procs(Ref, Type) ->
@@ -350,38 +492,34 @@ wait_for_connections_loop(Ref, Op, NumConns, Interval) ->
 	end.
 
 -spec filter_options([inet | inet6 | {atom(), any()} | {raw, any(), any(), any()}],
-	[atom()], Acc) -> Acc when Acc :: [any()].
-filter_options(UserOptions, DisallowedKeys, DefaultOptions) ->
-	AllowedOptions = filter_user_options(UserOptions, DisallowedKeys),
+	[atom()], Acc, module()) -> Acc when Acc :: [any()].
+filter_options(UserOptions, DisallowedKeys, DefaultOptions, Logger) ->
+	AllowedOptions = filter_user_options(UserOptions, DisallowedKeys, Logger),
 	lists:foldl(fun merge_options/2, DefaultOptions, AllowedOptions).
 
 %% 2-tuple options.
-filter_user_options([Opt = {Key, _}|Tail], DisallowedKeys) ->
+filter_user_options([Opt = {Key, _}|Tail], DisallowedKeys, Logger) ->
 	case lists:member(Key, DisallowedKeys) of
 		false ->
-			[Opt|filter_user_options(Tail, DisallowedKeys)];
+			[Opt|filter_user_options(Tail, DisallowedKeys, Logger)];
 		true ->
-			filter_options_warning(Opt),
-			filter_user_options(Tail, DisallowedKeys)
+			filter_options_warning(Opt, Logger),
+			filter_user_options(Tail, DisallowedKeys, Logger)
 	end;
 %% Special option forms.
-filter_user_options([inet|Tail], DisallowedKeys) ->
-	[inet|filter_user_options(Tail, DisallowedKeys)];
-filter_user_options([inet6|Tail], DisallowedKeys) ->
-	[inet6|filter_user_options(Tail, DisallowedKeys)];
-filter_user_options([Opt = {raw, _, _, _}|Tail], DisallowedKeys) ->
-	[Opt|filter_user_options(Tail, DisallowedKeys)];
-filter_user_options([Opt|Tail], DisallowedKeys) ->
-	filter_options_warning(Opt),
-	filter_user_options(Tail, DisallowedKeys);
-filter_user_options([], _) ->
+filter_user_options([inet|Tail], DisallowedKeys, Logger) ->
+	[inet|filter_user_options(Tail, DisallowedKeys, Logger)];
+filter_user_options([inet6|Tail], DisallowedKeys, Logger) ->
+	[inet6|filter_user_options(Tail, DisallowedKeys, Logger)];
+filter_user_options([Opt = {raw, _, _, _}|Tail], DisallowedKeys, Logger) ->
+	[Opt|filter_user_options(Tail, DisallowedKeys, Logger)];
+filter_user_options([Opt|Tail], DisallowedKeys, Logger) ->
+	filter_options_warning(Opt, Logger),
+	filter_user_options(Tail, DisallowedKeys, Logger);
+filter_user_options([], _, _) ->
 	[].
 
-filter_options_warning(Opt) ->
-	Logger = case get(logger) of
-		undefined -> logger;
-		Logger0 -> Logger0
-	end,
+filter_options_warning(Opt, Logger) ->
 	log(warning,
 		"Transport option ~p unknown or invalid.~n",
 		[Opt], Logger).

@@ -1,4 +1,4 @@
-%% Copyright (c) 2019, Jan Uhlig <ju@mailingwork.de>
+%% Copyright (c) 2019-2020, Jan Uhlig <ju@mailingwork.de>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -19,17 +19,22 @@
 -export([start_link/4]).
 -export([init/1]).
 
--spec start_link(ranch:ref(), pos_integer(), ranch:opts(), module()) -> {ok, pid()}.
-start_link(Ref, NumConnsSups, Transport, Protocol) ->
+-spec start_link(ranch:ref(), module(), module(), module()) -> {ok, pid()}.
+start_link(Ref, Transport, Protocol, Logger) ->
 	ok = ranch_server:cleanup_connections_sups(Ref),
 	supervisor:start_link(?MODULE, {
-		Ref, NumConnsSups, Transport, Protocol
+		Ref, Transport, Protocol, Logger
 	}).
 
-init({Ref, NumConnsSups, Transport, Protocol}) ->
+-spec init({ranch:ref(), module(), module(), module()})
+	-> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
+init({Ref, Transport, Protocol, Logger}) ->
+	TransOpts = ranch_server:get_transport_options(Ref),
+	NumAcceptors = maps:get(num_acceptors, TransOpts, 10),
+	NumConnsSups = maps:get(num_conns_sups, TransOpts, NumAcceptors),
 	ChildSpecs = [#{
 		id => {ranch_conns_sup, N},
-		start => {ranch_conns_sup, start_link, [Ref, N, Transport, Protocol]},
+		start => {ranch_conns_sup, start_link, [Ref, N, Transport, TransOpts, Protocol, Logger]},
 		type => supervisor
 	} || N <- lists:seq(1, NumConnsSups)],
-	{ok, {#{}, ChildSpecs}}.
+	{ok, {#{intensity => 1 + ceil(math:log2(NumConnsSups))}, ChildSpecs}}.

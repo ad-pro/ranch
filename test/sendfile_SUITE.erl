@@ -1,5 +1,5 @@
 %% Copyright (c) 2013, James Fish <james@fishcakez.com>
-%% Copyright (c) 2015-2018, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) 2015-2020, Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -242,7 +242,7 @@ do_ssl_chunk_size(Config) ->
 	Self = self(),
 	ChunkSize = 8 * 1024,
 	Fun = fun() ->
-		receive go -> ok after 1000 -> error(timeout) end,
+		receive go -> ok after 5000 -> error(timeout) end,
 		{ok, {Server, Client}} = sockets(Config),
 		{ok, RawFile} = file:open(Filename, [read, raw, binary]),
 		Ref = recv(Transport, Server, Size),
@@ -270,7 +270,7 @@ do_ssl_chunk_size(Config) ->
 sockets(Config) ->
 	Transport = config(transport, Config),
 	TransportOpts = config(transport_opts, Config),
-	{ok, LSocket} = Transport:listen(TransportOpts),
+	{ok, LSocket} = Transport:listen(#{socket_opts => TransportOpts}),
 	{ok, {_, Port}} = Transport:sockname(LSocket),
 	Self = self(),
 	Fun = fun() ->
@@ -279,8 +279,8 @@ sockets(Config) ->
 		Self ! {ok, Client}
 	end,
 	_ = spawn_link(Fun),
-	{ok, Server} = Transport:accept(LSocket, 500),
-	{ok, _} = Transport:handshake(Server, [], 500),
+	{ok, Server} = Transport:accept(LSocket, 5000),
+	{ok, _} = Transport:handshake(Server, [], 5000),
 	receive
 		{ok, Client} ->
 			ok = Transport:close(LSocket),

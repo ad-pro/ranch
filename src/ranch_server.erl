@@ -1,4 +1,5 @@
-%% Copyright (c) 2012-2018, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) 2012-2020, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) 2020, Jan Uhlig <j.uhlig@mailingwork.de>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -120,11 +121,13 @@ get_listener_sup(Ref) ->
 get_listener_sups() ->
 	[{Ref, Pid} || [Ref, Pid] <- ets:match(?TAB, {{listener_sup, '$1'}, '$2'})].
 
--spec set_addr(ranch:ref(), {inet:ip_address(), inet:port_number()} | {undefined, undefined}) -> ok.
+-spec set_addr(ranch:ref(), {inet:ip_address(), inet:port_number()} |
+	{local, binary()} | {undefined, undefined}) -> ok.
 set_addr(Ref, Addr) ->
 	gen_server:call(?MODULE, {set_addr, Ref, Addr}).
 
--spec get_addr(ranch:ref()) -> {inet:ip_address(), inet:port_number()} | {undefined, undefined}.
+-spec get_addr(ranch:ref()) -> {inet:ip_address(), inet:port_number()} |
+	{local, binary()} | {undefined, undefined}.
 get_addr(Ref) ->
 	ets:lookup_element(?TAB, {addr, Ref}, 2).
 
@@ -167,6 +170,7 @@ count_connections(Ref) ->
 
 %% gen_server.
 
+-spec init([]) -> {ok, #state{}}.
 init([]) ->
 	ConnMonitors = [{{erlang:monitor(process, Pid), Pid}, {conns_sup, Ref, Id}} ||
 		[Ref, Id, Pid] <- ets:match(?TAB, {{conns_sup, '$1', '$2'}, '$3'})],
@@ -174,6 +178,7 @@ init([]) ->
 		[Ref, Pid] <- ets:match(?TAB, {{listener_sup, '$1'}, '$2'})],
 	{ok, #state{monitors=ConnMonitors++ListenerMonitors}}.
 
+-spec handle_call(term(), {pid(), reference()}, #state{}) -> {reply, ok | ignore, #state{}}.
 handle_call({set_new_listener_opts, Ref, MaxConns, TransOpts, ProtoOpts, StartArgs}, _, State) ->
 	ets:insert_new(?TAB, {{max_conns, Ref}, MaxConns}),
 	ets:insert_new(?TAB, {{trans_opts, Ref}, TransOpts}),
@@ -198,14 +203,16 @@ handle_call({set_trans_opts, Ref, Opts}, _, State) ->
 	{reply, ok, State};
 handle_call({set_proto_opts, Ref, Opts}, _, State) ->
 	ets:insert(?TAB, {{proto_opts, Ref}, Opts}),
-	_ = [ConnsSup ! {set_opts, Opts} || {_, ConnsSup} <- get_connections_sups(Ref)],
+	_ = [ConnsSup ! {set_protocol_options, Opts} || {_, ConnsSup} <- get_connections_sups(Ref)],
 	{reply, ok, State};
 handle_call(_Request, _From, State) ->
 	{reply, ignore, State}.
 
+-spec handle_cast(_, #state{}) -> {noreply, #state{}}.
 handle_cast(_Request, State) ->
 	{noreply, State}.
 
+-spec handle_info(term(), #state{}) -> {noreply, #state{}}.
 handle_info({'DOWN', MonitorRef, process, Pid, Reason},
 		State=#state{monitors=Monitors}) ->
 	{_, TypeRef} = lists:keyfind({MonitorRef, Pid}, 1, Monitors),
@@ -225,9 +232,11 @@ handle_info({'DOWN', MonitorRef, process, Pid, Reason},
 handle_info(_Info, State) ->
 	{noreply, State}.
 
+-spec terminate(_, #state{}) -> ok.
 terminate(_Reason, _State) ->
 	ok.
 
+-spec code_change(term() | {down, term()}, #state{}, term()) -> {ok, term()}.
 code_change(_OldVsn, State, _Extra) ->
 	{ok, State}.
 
